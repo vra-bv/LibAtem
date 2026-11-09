@@ -72,20 +72,35 @@ namespace LibAtem.Test.Net
         [Fact]
         public void Packets_after_a_gap_are_delivered_in_order_once_it_fills()
         {
-            Receive(2);
-            Receive(3);
+            Receive(1);
             Receive(3);
             Receive(4);
-            Assert.Empty(_delivered);
+            Receive(4);
+            Receive(5);
+            Assert.Equal(new uint[] { 1 }, _delivered);
             Assert.Equal(3, _connection.OutOfOrderPackets);
 
-            Receive(1);
-            Assert.Equal(new uint[] { 1, 2, 3, 4 }, _delivered);
-            Assert.Equal(4u, ReadAcks().Last());
+            Receive(2);
+            Assert.Equal(new uint[] { 1, 2, 3, 4, 5 }, _delivered);
+            Assert.Equal(5u, ReadAcks().Last());
             Assert.Equal(0, _connection.OutOfOrderPackets);
 
+            Receive(3);
+            Assert.Equal(new uint[] { 1, 2, 3, 4, 5 }, _delivered);
+        }
+
+        [Fact]
+        public void Before_packet_1_nothing_else_is_accepted_or_acked()
+        {
+            Receive(401);
             Receive(2);
-            Assert.Equal(new uint[] { 1, 2, 3, 4 }, _delivered);
+            Assert.Empty(_delivered);
+            Assert.Equal(0, _connection.OutOfOrderPackets);
+            Assert.Empty(ReadAcks());
+
+            Receive(1);
+            Receive(2);
+            Assert.Equal(new uint[] { 1, 2 }, _delivered);
         }
 
         [Fact]
@@ -131,7 +146,8 @@ namespace LibAtem.Test.Net
             Assert.Equal(0, _connection.OutOfOrderPackets);
 
             _connection.ResetConnStatsInfo();
-            Receive(2);
+            Receive(1);
+            Receive(3);
             Assert.Equal(1, _connection.OutOfOrderPackets);
             _connection.ResetConnStatsInfo();
             Assert.Equal(0, _connection.OutOfOrderPackets);

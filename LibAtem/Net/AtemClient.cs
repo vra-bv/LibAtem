@@ -38,6 +38,8 @@ namespace LibAtem.Net
         private Thread _sendThread;
         private Thread _handleThread;
         private volatile bool _run;
+        private volatile bool _awaitingHandshake;
+        private volatile bool _sessionAssigned;
         private int _disposed;
         private int _sendThreadsStarted;
         private long _sendLoopIterations;
@@ -113,6 +115,7 @@ namespace LibAtem.Net
 
                 _run = true;
                 StartReceiving();
+                BeginSession();
                 SendHandshake();
                 StartSendThread();
                 StartHandleThread();
@@ -137,6 +140,7 @@ namespace LibAtem.Net
                         Raise(() => OnDisconnect?.Invoke(this), nameof(OnDisconnect));
 
                     Log.InfoFormat("Attempting Reconnect");
+                    BeginSession();
                     _connection.ResetConnStatsInfo();
                     _connection.SessionId = new Random().Next(32767);
                     SendHandshake();
@@ -147,6 +151,32 @@ namespace LibAtem.Net
                 Log.DebugFormat("Failed to reconnect: {0}", e);
             }
 
+            return true;
+        }
+
+        // The ATEM keeps resending the previous session's window for a while after a reconnect. Until the
+        // handshake reply and the new session's packet 1 arrive, those resends must not reach the connection.
+        private void BeginSession()
+        {
+            _awaitingHandshake = true;
+            _sessionAssigned = false;
+        }
+
+        // Returns false for a packet that belongs to no session or to another one than the current.
+        private bool AcceptSession(ReceivedPacket packet)
+        {
+            if (_awaitingHandshake)
+                return false;
+
+            if (_sessionAssigned)
+                return _connection.SessionId == packet.SessionId;
+
+            if (!packet.CommandCode.HasFlag(ReceivedPacket.CommandCodeFlags.AckRequest) || packet.PacketId != 1)
+                return false;
+
+            _connection.SessionId = (int)packet.SessionId;
+            _sessionAssigned = true;
+            Log.InfoFormat("Got new session id: {0}", packet.SessionId);
             return true;
         }
 
@@ -327,18 +357,19 @@ namespace LibAtem.Net
 
                         if (packet.CommandCode.HasFlag(ReceivedPacket.CommandCodeFlags.Handshake))
                         {
-                            Log.DebugFormat("Completed handshake");
-                            DataTransfer.Reset();
+                            if (_awaitingHandshake)
+                            {
+                                Log.DebugFormat("Completed handshake");
+                                DataTransfer.Reset();
+                                _awaitingHandshake = false;
+                            }
+                            // A resent handshake reply means our ack was lost: ack it again
                             _connection.SendAckNow(_client.Client, true);
                             continue;
                         }
 
-                        // TODO - should this only be allowed once?
-                        if (_connection.SessionId != packet.SessionId)
-                        {
-                            _connection.SessionId = (int)packet.SessionId;
-                            Log.InfoFormat("Got new session id: {0}", packet.SessionId);
-                        }
+                        if (!AcceptSession(packet))
+                            continue;
 
                         _connection.Receive(_client.Client, packet);
                     }

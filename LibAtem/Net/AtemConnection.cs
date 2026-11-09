@@ -259,6 +259,11 @@ namespace LibAtem.Net
             if (packet.PacketId >= MaxPacketId)
                 return deliver;
 
+            // A session starts at packet 1. Anything else before it is a resend from the previous session,
+            // and acking it would make its id the base for the new session's sequence.
+            if (!_readyToAck.HasValue && packet.PacketId != 1)
+                return deliver;
+
             uint lastAcked = _readyToAck.GetValueOrDefault(0);
             uint expected = IncrementPacketId(lastAcked);
 
