@@ -1,10 +1,9 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
-using System.Threading.Tasks;
 using log4net;
 using LibAtem.Commands;
 using LibAtem.Net.DataTransfer;
@@ -15,15 +14,33 @@ namespace LibAtem.Net
     {
         private static readonly ILog Log = LogManager.GetLogger(typeof(AtemClient));
 
+        public const int DefaultPort = 9910;
+
+        // How quickly the receive thread notices Dispose. Closing the socket does not reliably unblock a
+        // synchronous Receive: on macOS the close spins until the Receive returns.
+        private const int ReceivePollInterval = 100; // ms
+        private const int IdleSendWait = 100; // ms
+        // Room for a full initial state dump of a large switcher without the kernel dropping packets
+        private const int ReceiveBufferSize = 1 << 20;
+        private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(1);
+
+        [ThreadStatic]
+        private static AtemClient _timerCallbackOwner;
+
         private readonly UdpClient _client;
         private readonly IPEndPoint _remoteEp;
 
         private readonly AtemClientConnection _connection;
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+        private readonly object _lifecycleLock = new object();
         private Timer _timeoutTimer;
-        private Timer _ackTimer;
+        private Thread _receiveThread;
         private Thread _sendThread;
         private Thread _handleThread;
-        private bool _run;
+        private volatile bool _run;
+        private int _disposed;
+        private int _sendThreadsStarted;
+        private long _sendLoopIterations;
 
         public delegate void CommandHandler(object sender, IReadOnlyList<ICommand> commands);
         public delegate void ConnectedHandler(object sender);
@@ -43,15 +60,39 @@ namespace LibAtem.Net
 
         public ProtocolVersion? ConnectionVersion => _connection.ConnectionVersion;
 
-        public AtemClient(string address, bool autoConnect = true)
+        /// <summary>
+        /// Received packets waiting for the OnReceive handlers. See <see cref="AtemConnection.PendingInboundPackets"/>.
+        /// </summary>
+        public int PendingInboundPackets => _connection.PendingInboundPackets;
+
+        internal AtemClientConnection Connection => _connection;
+        internal Thread ReceiveThread => _receiveThread;
+        internal Thread SendThread => _sendThread;
+        internal Thread HandleThread => _handleThread;
+        internal int SendThreadsStarted => Volatile.Read(ref _sendThreadsStarted);
+        internal long SendLoopIterations => Interlocked.Read(ref _sendLoopIterations);
+
+        public AtemClient(string address, bool autoConnect = true) : this(address, DefaultPort, autoConnect)
         {
-            _remoteEp = new IPEndPoint(IPAddress.Parse(address), 9910);
+        }
+
+        public AtemClient(string address, int port, bool autoConnect = true)
+        {
+            _remoteEp = new IPEndPoint(IPAddress.Parse(address), port);
             _client = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
-            _client.Client.ReceiveBufferSize = 1500 * 50; // TODO tweak this value
+            try
+            {
+                _client.Client.ReceiveBufferSize = ReceiveBufferSize;
+            }
+            catch (SocketException)
+            {
+                _client.Client.ReceiveBufferSize = 1500 * 50;
+            }
+            _client.Client.ReceiveTimeout = ReceivePollInterval;
 
             _connection = new AtemClientConnection(_remoteEp, new Random().Next(32767));
-            _connection.OnDisconnect += sender => OnDisconnect?.Invoke(this);
-            _connection.OnInitComplete += sender => OnConnection?.Invoke(this);
+            _connection.OnDisconnect += sender => Raise(() => OnDisconnect?.Invoke(this), nameof(OnDisconnect));
+            _connection.OnInitComplete += sender => Raise(() => OnConnection?.Invoke(this), nameof(OnConnection));
 
             DataTransfer = new DataTransferManager(_connection);
 
@@ -61,18 +102,23 @@ namespace LibAtem.Net
 
         public bool Connect()
         {
-            // Check if connect has already been called
-            if (_run)
-                return false;
+            lock (_lifecycleLock)
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                    throw new ObjectDisposedException(nameof(AtemClient));
 
-            _run = true;
-            StartReceiving();
-            SendHandshake();
-            StartSendingTimer();
-            StartHandleThread();
-            StartTimeoutTimer();
-            StartAckTimer();
-            return true;
+                // Check if connect has already been called
+                if (_run)
+                    return false;
+
+                _run = true;
+                StartReceiving();
+                SendHandshake();
+                StartSendThread();
+                StartHandleThread();
+                StartTimeoutTimer();
+                return true;
+            }
         }
 
         private bool Reconnect()
@@ -81,17 +127,19 @@ namespace LibAtem.Net
             {
                 lock (_connection)
                 {
+                    if (!_run || _cts.IsCancellationRequested)
+                        return false;
+
                     if (!_connection.HasTimedOut)
                         return false;
 
                     if (_connection.ConnectionVersion != null)
-                        OnDisconnect?.Invoke(this);
+                        Raise(() => OnDisconnect?.Invoke(this), nameof(OnDisconnect));
 
                     Log.InfoFormat("Attempting Reconnect");
                     _connection.ResetConnStatsInfo();
                     _connection.SessionId = new Random().Next(32767);
                     SendHandshake();
-                    StartSendingTimer();
                 }
             }
             catch (SocketException e)
@@ -106,36 +154,62 @@ namespace LibAtem.Net
         {
             _timeoutTimer = new Timer(o =>
             {
-                if (!_connection.HasTimedOut)
+                if (!_run)
                     return;
 
-                Reconnect();
+                _timerCallbackOwner = this;
+                try
+                {
+                    if (_connection.HasTimedOut)
+                        Reconnect();
+                }
+                catch (Exception e)
+                {
+                    Log.ErrorFormat("Timeout check failed: {0}", e);
+                }
+                finally
+                {
+                    _timerCallbackOwner = null;
+                }
             }, null, 0, AtemConstants.TimeoutInterval);
         }
 
-        private void StartAckTimer()
+        // One send thread for the lifetime of the client. It also flushes deferred acks, so no separate
+        // ack timer is needed. It sleeps until something is queued, acked or reset, or an ack or resend is due.
+        private void StartSendThread()
         {
-            _ackTimer = new Timer(o =>
+            _sendThread = new Thread(() =>
             {
-                if (!_connection.HasTimedOut)
-                    return;
-
-                _connection.SendAckNow(_client.Client);
-            }, null, 0, AtemConstants.AckInterval);
-        }
-
-        private void StartSendingTimer()
-        {
-            _sendThread = new Thread(o =>
-            {
-                while (!_connection.HasTimedOut)
+                CancellationToken token = _cts.Token;
+                while (!token.IsCancellationRequested)
                 {
-                    if (!_connection.TrySendQueued(_client.Client))
-                        Thread.Sleep(1);
+                    Interlocked.Increment(ref _sendLoopIterations);
+
+                    bool sent = false;
+                    try
+                    {
+                        if (!_connection.HasTimedOut)
+                        {
+                            _connection.FlushPendingAck(_client.Client);
+                            sent = _connection.TrySendQueued(_client.Client);
+                        }
+                    }
+                    catch (ObjectDisposedException) when (token.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.ErrorFormat("Send failed: {0}", e);
+                    }
+
+                    if (!sent)
+                        _connection.WaitForOutbound(_connection.HasTimedOut ? IdleSendWait : _connection.NextSendWaitMs(IdleSendWait));
                 }
             });
             _sendThread.Name = "LibAtem.Send";
             _sendThread.IsBackground = true;
+            Interlocked.Increment(ref _sendThreadsStarted);
             _sendThread.Start();
         }
 
@@ -143,16 +217,43 @@ namespace LibAtem.Net
         {
             _handleThread = new Thread(o =>
             {
-                while (_run || _connection.HasCommandsToProcess)
+                CancellationToken token = _cts.Token;
+                while (!token.IsCancellationRequested)
                 {
-                    List<ICommand> cmds = _connection.GetNextCommands();
-                    int rawCount = cmds.Count;
+                    List<ICommand> cmds;
+                    try
+                    {
+                        cmds = _connection.GetNextCommands(token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Processing was completed by Dispose
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.ErrorFormat("Failed to parse received commands: {0}", e);
+                        continue;
+                    }
 
-                    cmds = cmds.Where(c => !DataTransfer.HandleCommand(c)).ToList();
-                    Log.DebugFormat("Recieved {0} commands. {1} to be handle by user code", rawCount, cmds.Count);
+                    try
+                    {
+                        int rawCount = cmds.Count;
 
-                    if (cmds.Any())
-                        OnReceive?.Invoke(this, cmds);
+                        cmds = cmds.Where(c => !DataTransfer.HandleCommand(c)).ToList();
+                        Log.DebugFormat("Recieved {0} commands. {1} to be handle by user code", rawCount, cmds.Count);
+
+                        if (cmds.Any())
+                            OnReceive?.Invoke(this, cmds);
+                    }
+                    catch (Exception e)
+                    {
+                        Log.ErrorFormat("Handling received commands failed: {0}", e);
+                    }
                 }
             });
             _handleThread.Name = "LibAtem.Handle";
@@ -175,19 +276,52 @@ namespace LibAtem.Net
             };
 
             Log.DebugFormat("Starting handshake");
-            _client.SendAsync(handshake, handshake.Length, _remoteEp);
+            try
+            {
+                _client.Send(handshake, handshake.Length, _remoteEp);
+            }
+            catch (SocketException e)
+            {
+                Log.DebugFormat("Failed to send handshake: {0}", e.SocketErrorCode);
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
         private void StartReceiving()
         {
-            var thread = new Thread(() =>
+            _receiveThread = new Thread(() =>
             {
-                while (_run)
+                CancellationToken token = _cts.Token;
+                while (_run && !token.IsCancellationRequested)
                 {
+                    byte[] data;
                     try
                     {
                         IPEndPoint ep = _remoteEp;
-                        byte[] data = _client.Receive(ref ep);
+                        data = _client.Receive(ref ep);
+                    }
+                    catch (SocketException e) when (e.SocketErrorCode == SocketError.TimedOut)
+                    {
+                        continue;
+                    }
+                    catch (SocketException e)
+                    {
+                        if (!_run)
+                            break;
+                        Log.ErrorFormat("Socket Exception: {0}", e.SocketErrorCode);
+                        continue;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break;
+                    }
+
+                    try
+                    {
+                        if (data.Length < ReceivedPacket.HeaderLength)
+                            continue;
 
                         ReceivedPacket packet = new ReceivedPacket(data);
 
@@ -208,15 +342,19 @@ namespace LibAtem.Net
 
                         _connection.Receive(_client.Client, packet);
                     }
-                    catch (SocketException)
+                    catch (ObjectDisposedException)
                     {
-                        Log.ErrorFormat("Socket Exception");
+                        break;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.ErrorFormat("Failed to handle received packet: {0}", e);
                     }
                 }
             });
-            thread.Name = "LibAtem.Receive";
-            thread.IsBackground = true;
-            thread.Start();
+            _receiveThread.Name = "LibAtem.Receive";
+            _receiveThread.IsBackground = true;
+            _receiveThread.Start();
         }
 
         public void SendCommand(ICommand cmd)
@@ -229,13 +367,83 @@ namespace LibAtem.Net
             _connection.QueueMessage(msg);
         }
 
+        private static void Raise(Action invoke, string name)
+        {
+            try
+            {
+                invoke();
+            }
+            catch (Exception e)
+            {
+                Log.ErrorFormat("{0} handler threw: {1}", name, e);
+            }
+        }
+
+        /// <summary>
+        /// Stops all threads and the timer, then closes the socket. No event fires once Dispose has started.
+        /// Safe to call more than once, and from inside an event handler.
+        /// </summary>
         public void Dispose()
         {
-            // TODO
+            lock (_lifecycleLock)
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                    return;
 
+                OnReceive = null;
+                OnConnection = null;
+                OnDisconnect = null;
+
+                _run = false;
+                _cts.Cancel();
+            }
+
+            bool fromTimer = _timerCallbackOwner == this;
+            DisposeTimer(_timeoutTimer, !fromTimer);
+
+            _connection.CompleteProcessing();
+
+            // The receive thread must be out of Receive before the socket is closed
+            bool joined = Join(_receiveThread);
+            joined &= Join(_sendThread);
+            joined &= Join(_handleThread);
+
+            _client.Dispose();
             DataTransfer?.Dispose();
 
-            _timeoutTimer?.Dispose();
+            // A thread still running (Dispose called from one of ours) may still read the token
+            if (joined && !fromTimer)
+                _cts.Dispose();
+        }
+
+        private static void DisposeTimer(Timer timer, bool waitForCallbacks)
+        {
+            if (timer == null)
+                return;
+
+            if (!waitForCallbacks)
+            {
+                timer.Dispose();
+                return;
+            }
+
+            // Not disposed after the wait: the timer may still signal it if a callback overruns the timeout
+            var done = new ManualResetEvent(false);
+            if (timer.Dispose(done))
+                done.WaitOne(ShutdownTimeout);
+        }
+
+        private static bool Join(Thread thread)
+        {
+            if (thread == null)
+                return true;
+            if (thread == Thread.CurrentThread)
+                return false;
+            if (thread.Join(ShutdownTimeout))
+                return true;
+
+            Log.WarnFormat("{0} did not stop within {1}ms", thread.Name, ShutdownTimeout.TotalMilliseconds);
+            return false;
         }
 
         public bool HasQueuedOutbound()
@@ -244,4 +452,3 @@ namespace LibAtem.Net
         }
     }
 }
-

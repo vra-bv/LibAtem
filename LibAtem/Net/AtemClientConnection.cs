@@ -24,6 +24,7 @@ namespace LibAtem.Net
             {
                 _queuedCommands.Add(command);
             }
+            SignalOutbound();
         }
 
         protected override OutboundMessage CompileNextMessage()
